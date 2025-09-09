@@ -1,0 +1,12 @@
+name: GitHub Webhook Payload
+description: Retrieves GitHub webhook payload from Buildkite GraphQL API and sets BUILDKITE_COMMIT_BEFORE environment variable
+author: https://github.com/jasonwbarnett
+requirements:
+  - curl
+  - jq
+configuration:
+  properties:
+    debug:
+      type: boolean
+      description: Enable debug logging for troubleshooting
+  additionalProperties: false

@@ -1,0 +1,133 @@
+#!/bin/bash
+set -euo pipefail
+
+# Plugin configuration
+DEBUG_ENABLED="${BUILDKITE_PLUGIN_GITHUB_WEBHOOK_PAYLOAD_DEBUG:-false}"
+
+# Required Buildkite environment variables
+BUILDKITE_API_TOKEN="${BUILDKITE_API_TOKEN:?BUILDKITE_API_TOKEN must be set (use set-buildkite-api-token plugin)}"
+BUILDKITE_BUILD_ID="${BUILDKITE_BUILD_ID:?BUILDKITE_BUILD_ID must be set}"
+
+# Logging functions
+log_debug() {
+    if [[ "$DEBUG_ENABLED" == "true" ]]; then
+        echo "🔍 [github-webhook-payload] DEBUG: $*" >&2
+    fi
+}
+
+log_info() {
+    echo "📡 [github-webhook-payload] $*"
+}
+
+log_error() {
+    echo "❌ [github-webhook-payload] ERROR: $*" >&2
+}
+
+# Main function to retrieve webhook payload and set BUILDKITE_COMMIT_BEFORE
+retrieve_webhook_payload() {
+    log_info "Retrieving GitHub webhook payload from Buildkite GraphQL API..."
+    log_debug "Build ID: $BUILDKITE_BUILD_ID"
+
+    # GraphQL query to get webhook payload
+    local graphql_query='{
+        "query": "query { build(uuid: \"'$BUILDKITE_BUILD_ID'\") { source { ... on BuildSourceWebhook { payload } } } }"
+    }'
+
+    log_debug "GraphQL query: $graphql_query"
+
+    # Make API request - capture both success and error responses
+    local response
+    local curl_exit_code
+    response=$(curl -s \
+        -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "$graphql_query" \
+        -w "\nHTTP_CODE:%{http_code}" \
+        https://graphql.buildkite.com/v1 2>&1)
+    curl_exit_code=$?
+
+    # Extract HTTP status code from response
+    local http_code
+    http_code=$(echo "$response" | grep "HTTP_CODE:" | cut -d: -f2)
+    # Remove the HTTP status line from response
+    response=$(echo "$response" | sed '/HTTP_CODE:/d')
+
+    # Check for curl errors or HTTP errors
+    if [[ $curl_exit_code -ne 0 ]]; then
+        log_error "Failed to connect to Buildkite GraphQL API (curl exit code: $curl_exit_code)"
+        log_error "Curl output: $response"
+        return 1
+    fi
+
+    if [[ "$http_code" != "200" ]]; then
+        log_error "Buildkite GraphQL API returned HTTP $http_code"
+        log_error "Response body: $response"
+        return 1
+    fi
+
+    log_debug "API response: $response"
+
+    # Check for GraphQL errors in the response
+    local graphql_errors
+    graphql_errors=$(echo "$response" | jq -r '.errors // empty' 2>/dev/null)
+    if [[ -n "$graphql_errors" && "$graphql_errors" != "null" ]]; then
+        log_error "GraphQL API returned errors:"
+        log_error "$graphql_errors"
+        return 1
+    fi
+
+    # Extract payload string from GraphQL response
+    local payload_string
+    if ! payload_string=$(echo "$response" | jq -r '.data.build.source.payload // empty' 2>/dev/null); then
+        log_error "Failed to parse GraphQL response with jq"
+        log_error "Response was: $response"
+        return 1
+    fi
+
+    # Check if payload exists and is not null/empty
+    if [[ -z "$payload_string" || "$payload_string" == "null" ]]; then
+        log_error "No GitHub webhook payload found in build source"
+        log_debug "This build may not have been triggered by a webhook"
+        log_debug "GraphQL response data.build.source: $(echo "$response" | jq -r '.data.build.source // empty' 2>/dev/null)"
+        return 1
+    fi
+
+    log_debug "Payload string: $payload_string"
+
+    # Parse the payload string as JSON to extract the 'before' SHA
+    local before_sha
+    if ! before_sha=$(echo "$payload_string" | jq -r '.before // empty' 2>/dev/null); then
+        log_error "Failed to parse GitHub webhook payload JSON"
+        return 1
+    fi
+
+    # Check if 'before' SHA exists and is not null/empty
+    if [[ -z "$before_sha" || "$before_sha" == "null" ]]; then
+        log_error "No 'before' SHA found in GitHub webhook payload"
+        log_debug "Payload may not contain commit information"
+        return 1
+    fi
+
+    # Validate SHA format (basic check for 40-character hex string)
+    if [[ ! "$before_sha" =~ ^[a-f0-9]{40}$ ]]; then
+        log_error "Invalid SHA format: $before_sha"
+        return 1
+    fi
+
+    # Set the environment variable
+    export BUILDKITE_COMMIT_BEFORE="$before_sha"
+    log_info "Successfully set BUILDKITE_COMMIT_BEFORE=$before_sha"
+
+    # Show comparison for context
+    if [[ -n "${BUILDKITE_COMMIT:-}" ]]; then
+        log_info "Current commit: $BUILDKITE_COMMIT"
+        log_info "Previous commit: $BUILDKITE_COMMIT_BEFORE"
+    fi
+}
+
+# Execute main function
+if ! retrieve_webhook_payload; then
+    log_error "Failed to retrieve GitHub webhook payload and set BUILDKITE_COMMIT_BEFORE"
+    log_info "Continuing build without BUILDKITE_COMMIT_BEFORE (non-fatal error)"
+    # Don't exit 1 here as this should be non-fatal for builds not triggered by webhooks
+fi
